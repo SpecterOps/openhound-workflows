@@ -1,0 +1,73 @@
+name: Build Python distributions
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Existing release tag in the calling repository
+        required: true
+        type: string
+      python-version:
+        type: string
+        default: '3.13'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+      - uses: astral-sh/setup-uv@v7
+      - name: Build wheel and sdist
+        run: uv build --out-dir dist
+      - name: Verify distribution versions against the release tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          uv run --no-project --with packaging python - <<'PY'
+          import email
+          import os
+          import re
+          import tarfile
+          import zipfile
+          from pathlib import Path
+          from packaging.version import Version
+
+          tag = os.environ['RELEASE_TAG']
+          assert re.fullmatch(
+              r'v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+              r'((a|b|rc)[0-9]+|-(alpha|beta|rc)\.[0-9]+)?', tag
+          ), 'Unsupported release tag'
+          expected = Version(tag)
+          assert not expected.is_devrelease and expected.local is None, 'Not a release version'
+          wheels = list(Path('dist').glob('*.whl'))
+          sdists = list(Path('dist').glob('*.tar.gz'))
+          assert len(wheels) == len(sdists) == 1, 'Expected one wheel and one sdist'
+          with zipfile.ZipFile(wheels[0]) as archive:
+              names = [n for n in archive.namelist() if n.endswith('.dist-info/METADATA')]
+              assert len(names) == 1
+              wheel = email.message_from_bytes(archive.read(names[0]))
+          with tarfile.open(sdists[0]) as archive:
+              names = [n for n in archive.getnames() if n.count('/') == 1 and n.endswith('/PKG-INFO')]
+              assert len(names) == 1
+              sdist = email.message_from_bytes(archive.extractfile(names[0]).read())
+          assert wheel['Name'] == sdist['Name']
+          for metadata in (wheel, sdist):
+              assert Version(metadata['Version']) == expected, (metadata['Version'], str(expected))
+          print(f"Verified {wheel['Name']} {expected} in wheel and sdist")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-distributions
+          path: dist/
+          if-no-files-found: error
+          overwrite: true

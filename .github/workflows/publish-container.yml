@@ -1,0 +1,169 @@
+name: Publish collector containers
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+      prerelease:
+        type: boolean
+        default: false
+      version-build-arg:
+        type: string
+        default: COLLECTOR_VERSION
+
+permissions:
+  contents: read
+  packages: write
+
+# Serialize releases and reruns across both targets before comparing aliases.
+concurrency:
+  group: collector-container-${{ github.repository }}
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [cli, enterprise]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+      - name: Validate release and derive image metadata
+        id: image
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          VERSION_BUILD_ARG: ${{ inputs.version-build-arg }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          VERSION=${RELEASE_TAG#v}
+          [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)((a|b|rc)[0-9]+|-(alpha|beta|rc)\.[0-9]+)?$ ]] || {
+            echo 'Expected [v]MAJOR.MINOR.PATCH with optional rcN, aN, bN, -alpha.N, -beta.N or -rc.N' >&2
+            exit 1
+          }
+          [[ "$VERSION_BUILD_ARG" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || exit 1
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$PRERELEASE" != true ]]; then
+            echo 'Prerelease version requires prerelease=true' >&2
+            exit 1
+          fi
+          IMAGE="ghcr.io/${REPOSITORY,,}"
+          SUFFIX=''
+          if [[ "$TARGET" == cli ]]; then SUFFIX='-cli'; fi
+          {
+            echo "version=$VERSION"
+            echo "tag=$IMAGE:$VERSION$SUFFIX"
+            echo "latest=$IMAGE:latest$SUFFIX"
+          } >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - name: Build local smoke image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          platforms: linux/amd64
+          load: true
+          tags: collector:smoke
+          build-args: |
+            ${{ inputs.version-build-arg }}=${{ steps.image.outputs.version }}
+          cache-from: type=gha,scope=${{ matrix.target }}
+      - name: Check non-root runtime and Python
+        run: |
+          docker run --rm --network none --entrypoint python collector:smoke -c '
+          import os
+          assert os.getuid() != 0 and os.getgid() != 0
+          '
+      - name: Run collector smoke contract
+        env:
+          EXPECTED_VERSION: ${{ steps.image.outputs.version }}
+          CONTAINER_TARGET: ${{ matrix.target }}
+        run: |
+          test -f .github/scripts/container-smoke.py
+          docker run --rm -i --network none --entrypoint python \
+            -e EXPECTED_VERSION -e CONTAINER_TARGET \
+            collector:smoke - < .github/scripts/container-smoke.py
+      - name: Check CLI help
+        if: matrix.target == 'cli'
+        run: docker run --rm --network none collector:smoke --help
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish versioned multi-platform image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          sbom: true
+          provenance: false
+          tags: ${{ steps.image.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.image.outputs.version }}
+          build-args: |
+            ${{ inputs.version-build-arg }}=${{ steps.image.outputs.version }}
+          cache-from: type=gha,scope=${{ matrix.target }}
+
+  promote:
+    needs: publish
+    if: ${{ !inputs.prerelease }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Select newest published stable release by version
+        id: release
+        uses: actions/github-script@v8
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        with:
+          script: |
+            const stable = /^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              ...context.repo, per_page: 100
+            });
+            const versions = releases.filter(r => !r.draft && !r.prerelease && stable.test(r.tag_name));
+            const compare = (a, b) => {
+              const av = a.tag_name.match(stable).slice(1).map(BigInt);
+              const bv = b.tag_name.match(stable).slice(1).map(BigInt);
+              for (let i = 0; i < 3; i++) {
+                if (av[i] !== bv[i]) return av[i] > bv[i] ? -1 : 1;
+              }
+              return 0;
+            };
+            versions.sort(compare);
+            if (!versions.some(r => r.tag_name === process.env.RELEASE_TAG)) {
+              throw new Error('Current tag must have a published stable GitHub Release');
+            }
+            const eligible = compare({tag_name: process.env.RELEASE_TAG}, versions[0]) === 0;
+            core.setOutput('eligible', String(eligible));
+            core.info(`Newest stable release: ${versions[0].tag_name}; promote: ${eligible}`);
+      - uses: docker/setup-buildx-action@v4
+        if: steps.release.outputs.eligible == 'true'
+      - uses: docker/login-action@v3
+        if: steps.release.outputs.eligible == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Promote both tested targets
+        if: steps.release.outputs.eligible == 'true'
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          VERSION=${RELEASE_TAG#v}
+          IMAGE="ghcr.io/${REPOSITORY,,}"
+          for SUFFIX in '' '-cli'; do
+            docker buildx imagetools create --tag "$IMAGE:latest$SUFFIX" "$IMAGE:$VERSION$SUFFIX"
+          done
