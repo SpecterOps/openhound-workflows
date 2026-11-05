@@ -27,10 +27,8 @@ Your collector needs:
   `COLLECTOR_VERSION` to set the installed collector version. Both targets must
   support AMD64 and ARM64 and run as a non-root user.
 - A `.dockerignore` that keeps credentials and local data out of the build.
-- `.github/scripts/container-smoke.py`: a small test that checks the installed
-  collector works without real service credentials.
 
-The exact smoke-test requirements and Docker version-cache advice are in the
+The container requirements and Docker version-cache advice are in the
 [technical reference](RELEASE-REFERENCE.md#onboard-another-collector).
 
 ## 3. Add a release workflow to your collector

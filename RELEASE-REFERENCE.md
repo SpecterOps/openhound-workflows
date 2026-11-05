@@ -89,7 +89,7 @@ Verify this contract first:
 | Plugin | Installed `openhound.sources` entry point loads the collector | `okta` loads `openhound_okta.main:app` |
 | Metadata | Required extension metadata is included in the wheel and runtime | `openhound_okta/extension.yaml` is force-included |
 | Runtime | Non-root UID and GID; CLI entrypoint accepts `--help` | UID/GID 65532; distroless Python 3.13 |
-| Scheduler | Initialization tested with a mocked service, no real credentials or collection | `/app/src/scheduler.py`, mocked `Service.start` |
+| Scheduler | Scheduler entrypoint included in the enterprise image | `/app/src/scheduler.py` |
 | Architectures | Resolve/build dependencies on both AMD64 and ARM64 | `uv.lock` and base images must work on both |
 | Context | Exclude runtime credentials, local environments and collection data | `.dockerignore` allowlists build metadata and `src/`; excludes key/certificate files |
 
@@ -97,17 +97,10 @@ Do not place runtime credentials under an allowlisted source directory. Inject
 credentials only at runtime. Do not assume all collectors use VCS versioning or
 Okta's imports, plugin name, scheduler configuration, or UID.
 
-Each collector supplies `.github/scripts/container-smoke.py`. The shared
-workflow feeds it to `python -` **inside each locally built image**, with network
-disabled, working directory from the Dockerfile, and environment variables
-`EXPECTED_VERSION` (release tag without `v`) and `CONTAINER_TARGET` (`cli` or
-`enterprise`). Exit nonzero on failure. Do not require the script in the image or
-widen `.dockerignore` for it. The script must import the collector, compare its
-installed distribution version using Python normalization, load its entry point,
-check packaged extension metadata and expected UID/GID, and initialize its
-scheduler with a mocked service. The shared workflow separately checks nonzero
-UID/GID and CLI `--help`. The pilot script uses `packaging`, already a runtime
-dependency through OpenHound; verify this when adapting it.
+The shared workflow checks that Python runs with nonzero UID/GID in both locally
+built images and that the CLI accepts `--help`, with network disabled. No
+collector-specific smoke script is required. These checks do not verify the
+installed collector version, plugin metadata, or scheduler initialization.
 
 ## External configuration
 

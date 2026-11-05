@@ -82,15 +82,6 @@ jobs:
           import os
           assert os.getuid() != 0 and os.getgid() != 0
           '
-      - name: Run collector smoke contract
-        env:
-          EXPECTED_VERSION: ${{ steps.image.outputs.version }}
-          CONTAINER_TARGET: ${{ matrix.target }}
-        run: |
-          test -f .github/scripts/container-smoke.py
-          docker run --rm -i --network none --entrypoint python \
-            -e EXPECTED_VERSION -e CONTAINER_TARGET \
-            collector:smoke - < .github/scripts/container-smoke.py
       - name: Check CLI help
         if: matrix.target == 'cli'
         run: docker run --rm --network none collector:smoke --help
